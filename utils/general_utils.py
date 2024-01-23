@@ -18,6 +18,7 @@ import random
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
+# 将输入的图片转成（通道，高度，宽度）的张量
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
@@ -26,6 +27,7 @@ def PILtoTorch(pil_image, resolution):
     else:
         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
 
+# 生成一个连续的学习率衰减函数，这个函数根据训练的进度动态调整学习率。
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000
 ):
@@ -42,6 +44,14 @@ def get_expon_lr_func(
     :param conf: config subtree 'lr' or similar
     :param max_steps: int, the number of steps during optimization.
     :return HoF which takes step as input
+
+    连续学习率衰减函数。改编自JaxNeRF
+    当step=0时返回率为lr_init, 当step=max_steps时返回率为lr_final, 并在其他地方进行对数线性插值(相当于指数衰减)。
+    如果lr_delay_steps>0, 则学习率将通过lr_delay_mult的某个平滑函数进行缩放, 
+    使得初始学习率在优化开始时为lr_init*lr_delay_mult, 但在step_lr_delay_steps时将缓回到正常学习率。
+    :param conf: config subtree 'lr'或类似的
+    :param max_steps: int, 优化期间的步骤数。
+    :返回以step为输入的HoF
     """
 
     def helper(step):
@@ -75,6 +85,7 @@ def strip_lowerdiag(L):
 def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
+# 将 N x 4 的旋转四元组转换成 N x 3 x 3 的旋转矩阵, N 为点云中点的个数或者3D gaussian的个数
 def build_rotation(r):
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
 

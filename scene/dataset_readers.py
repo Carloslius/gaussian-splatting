@@ -42,6 +42,7 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
 
+# 计算所有相机的平均中心点位置，以及它到最远camera的距离
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
@@ -56,15 +57,21 @@ def getNerfppNorm(cam_info):
     for cam in cam_info:
         W2C = getWorld2View2(cam.R, cam.T)
         C2W = np.linalg.inv(W2C)
+        # 相机在世界坐标系下的中心
         cam_centers.append(C2W[:3, 3:4])
 
+    # 计算在世界坐标系下的场景中心和对角线长度
     center, diagonal = get_center_and_diag(cam_centers)
+    # 确保整个场景被覆盖
     radius = diagonal * 1.1
 
+    # 将场景中心移到原点
     translate = -center
 
     return {"translate": translate, "radius": radius}
 
+# 处理相机参数和关联的图像信息，返回一个包含这些信息的列表
+# 返回的cam_infos中的cam_info都代表一张Image的信息
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -73,6 +80,18 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
         sys.stdout.flush()
 
+        # 外参 images[image_id] = 
+        #   Image(
+        #       id=image_id, qvec=qvec, tvec=tvec,
+        #       camera_id=camera_id, name=image_name,
+        #       xys=xys, point3D_ids=point3D_ids)
+        # 内参 cameras[camera_id] = 
+        #   Camera(
+        #       id=camera_id,
+        #       model=model_name,
+        #       width=width,
+        #       height=height,
+        #       params=np.array(params))
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
         height = intr.height
@@ -82,6 +101,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
+        # 分别计算水平方向的视场角FovX和垂直方向的视场角FovY
         if intr.model=="SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
@@ -104,6 +124,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
+# 从PLY文件中提取点云数据，包括点的位置、颜色和法线信息
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
@@ -112,6 +133,7 @@ def fetchPly(path):
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
+# 将包含位置、颜色和默认零值法线的点云数据保存到指定路径的PLY文件中
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
@@ -129,11 +151,21 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+# 从COLMAP中读取每张图片对应的相机内外参
 def readColmapSceneInfo(path, images, eval, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        # Image(
+        #     id=image_id, qvec=qvec, tvec=tvec,
+        #     camera_id=camera_id, name=image_name,
+        #     xys=xys, point3D_ids=point3D_ids)
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        # Camera(id=camera_id,
+        #        model=model_name,
+        #        width=width,
+        #        height=height,
+        #        params=np.array(params))
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
@@ -141,10 +173,15 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
+    # 读取每张图片, 并将每张图片对应的相机外参转为R、T矩阵, 相机内参转为FoV参数
     reading_dir = "images" if images == None else images
+    # cam_infos_unsorted是cam_infos
+    # cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+    #                       image_path=image_path, image_name=image_name, width=width, height=height)
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
+    # 训练集和测试集划分，eval默认False
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
@@ -152,8 +189,10 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         train_cam_infos = cam_infos
         test_cam_infos = []
 
+    # 计算所有相机的平均中心点位置, 以及它到最远camera的距离
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
+    # 读取点云
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
@@ -176,6 +215,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
                            ply_path=ply_path)
     return scene_info
 
+# 下面这两个函数暂时不需要管
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
     cam_infos = []
 

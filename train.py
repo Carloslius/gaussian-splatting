@@ -28,30 +28,41 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+# training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations,
+#     args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    # 创建 `GaussianModel` 模型，给点云中的每个点创建一个3D gaussian
     gaussians = GaussianModel(dataset.sh_degree)
+    # 加载数据集和每张图片对应的camera的参数
     scene = Scene(dataset, gaussians)
+    # 为3D gaussian的各组参数创建optimizer以及lr_scheduler
     gaussians.training_setup(opt)
+    # 加载预训练模型参数
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # 选择背景颜色
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    # 创建 CUDA 事件以用于计时
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
+    # 用于存储相机视角
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):   
+        # 尝试连接和处理网络 GUI 的连接     
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
+            # 处理来自网络 GUI 的指令和渲染图像
             try:
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
@@ -64,29 +75,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
+        # 开始计时
         iter_start.record()
 
+        # 根据迭代次数更新学习率，对xyz的学习率进行调整
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
+        # 每1000次迭代提升球谐函数的 level，将球谐函数的次数增加1
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        # 随机选择一个图片及其相应的相机视角(内外参)
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
+        # 如果达到调试起始点，则开启调试模式
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        # 根据选项随机选择或使用固定背景
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
+        # 根据3D gaussian渲染该相机视角的图像
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
+        # 在渲染得到的图像和GT图像之间算loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -96,6 +115,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with torch.no_grad():
             # Progress bar
+            # 更新进度图并输出 Loss
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -104,33 +124,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
+            # 记录训练过程中的信息，如损失值、迭代时间等
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
+                # 保存当前迭代的模型状态
                 scene.save(iteration)
 
             # Densification
+            # 检查当前迭代数是否小于指定的密集化截止迭代数 
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
+                # 更新每个可见点的最大半径
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                # 根据渲染出来的点统计3D gaussian均值(xyz)的梯度, 用于对3D gaussians的克隆或者切分
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
+                # 检查当前迭代是否大于密集化开始迭代数 (densify_from_iter) 且是密集化间隔的倍数
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    # 如果当前迭代大于透明度重置间隔，则使用特定的大小阈值，否则不使用大小阈值。
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                    # 执行密集化和修剪操作
+                    # 在模型的密集区域添加更多的高斯点，并删除那些小于特定梯度阈值或大小阈值的点
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                 
+                # 检查是否达到透明度重置间隔，或者是在数据集要求白色背景且当前迭代是密集化开始迭代数
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                    # 对3D gaussians的不透明度进行重置
                     gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
+                # 基于之前计算的梯度来更新模型参数
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
+            # 如果到了保存模型的迭代数，保存模型
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+# 创建output文件夹并记录参数、日志
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
